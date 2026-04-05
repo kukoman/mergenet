@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-var Version = "1.0.2"
+var Version = "1.0.3"
 
 const (
 	probeTarget  = "1.1.1.1:53"
