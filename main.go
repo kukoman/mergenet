@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -10,11 +11,12 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 )
 
-var Version = "1.2.1"
+var Version = "1.2.2"
 
 const (
 	probeTarget  = "1.1.1.1:53"
@@ -216,7 +218,7 @@ func main() {
 	// Start proxy listener.
 	proxyLn, err := net.Listen("tcp", listenAddr)
 	if err != nil {
-		log.Fatalf("listen %s: %v", listenAddr, err)
+		fatalListenError(listenAddr, err)
 	}
 	mode := "SOCKS5 + HTTP"
 	if pc.Minter != nil {
@@ -344,4 +346,56 @@ func scanOnce(b *Balancer) {
 			b.SetHealthy(v.Name, false)
 		}
 	}
+}
+
+// fatalListenError prints an actionable explanation of a listener bind
+// failure and exits. Specialises the common port-already-in-use case
+// (typically another mergenet instance still running) with platform-
+// appropriate commands to find and stop the offending process. Holds the
+// console open on Windows double-click launches so the user actually sees
+// the message before the window closes.
+func fatalListenError(addr string, err error) {
+	port := addr
+	if i := strings.LastIndex(addr, ":"); i >= 0 {
+		port = addr[i+1:]
+	}
+	fmt.Fprintln(os.Stderr)
+	if isAddrInUse(err) {
+		fmt.Fprintf(os.Stderr, "ERROR: cannot start proxy on %s — port already in use.\n\n", addr)
+		fmt.Fprintln(os.Stderr, "Another process is bound to that port (usually a previous mergenet")
+		fmt.Fprintln(os.Stderr, "instance that's still running). Find and stop it:")
+		fmt.Fprintln(os.Stderr)
+		if runtime.GOOS == "windows" {
+			fmt.Fprintf(os.Stderr, "    netstat -ano | findstr :%s\n", port)
+			fmt.Fprintln(os.Stderr, "    taskkill /F /PID <pid>")
+		} else {
+			fmt.Fprintf(os.Stderr, "    lsof -iTCP:%s -sTCP:LISTEN -n -P\n", port)
+			fmt.Fprintln(os.Stderr, "    kill <pid>")
+		}
+		fmt.Fprintln(os.Stderr)
+		fmt.Fprintln(os.Stderr, "Or start mergenet on a different port:")
+		fmt.Fprintln(os.Stderr, "    mergenet --listen 127.0.0.1:1081")
+	} else {
+		fmt.Fprintf(os.Stderr, "ERROR: cannot bind to %s: %v\n\n", addr, err)
+		fmt.Fprintln(os.Stderr, "Try a different address/port:")
+		fmt.Fprintln(os.Stderr, "    mergenet --listen 127.0.0.1:1081")
+	}
+	fmt.Fprintln(os.Stderr)
+	pauseOnDoubleClick()
+	os.Exit(1)
+}
+
+// isAddrInUse reports whether err represents an EADDRINUSE / WSAEADDRINUSE
+// bind failure, regardless of platform. On Windows the net package surfaces
+// the raw WSA error code (10048) rather than mapping to syscall.EADDRINUSE,
+// so we check both paths.
+func isAddrInUse(err error) bool {
+	if errors.Is(err, syscall.EADDRINUSE) {
+		return true
+	}
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		return errno == 10048 // Windows: WSAEADDRINUSE
+	}
+	return false
 }
