@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-var Version = "1.1.0"
+var Version = "1.2.0"
 
 const (
 	probeTarget  = "1.1.1.1:53"
@@ -237,24 +237,34 @@ func main() {
 		close(done)
 	}()
 
-	// TUI stdin keystroke listener: 'm' + Enter toggles the MITM module on/off
-	// at runtime. Only active when MITM is actually available (CA ready).
-	if status.MITMAvailable && !*logMode {
-		go runKeypressLoop(mitmCtrl, done)
+	// TUI mode log sink: buffered in-memory writer that flushes to disk every
+	// 5s, opening+closing the file per flush (so the log file isn't held
+	// open/locked for the whole session). Disabled by default — user toggles
+	// with 'l'+Enter when they actually want to capture logs.
+	var logSink *LogSink
+	if !*logMode && *logFile != "" {
+		logSink = NewLogSink(*logFile, 5*time.Second)
+		flushCtx, flushCancel := context.WithCancel(context.Background())
+		defer flushCancel()
+		go logSink.RunFlusher(flushCtx)
+		status.LogSink = logSink
+	}
+
+	// TUI stdin keystroke listener: 'm'+Enter toggles MITM, 'l'+Enter toggles
+	// log writing. Started whenever the TUI is up — either toggle is useful
+	// on its own, so don't gate on MITM availability.
+	if !*logMode {
+		go runKeypressLoop(mitmCtrl, logSink, done)
 	}
 
 	if *logMode {
 		// Classic scrolling log. Block until signal.
 		<-done
 	} else {
-		// TUI mode: redirect log output away from stdout so it doesn't clobber the UI.
+		// TUI mode: route log output through the sink (no-op until toggled on).
 		var logOut io.Writer = io.Discard
-		if *logFile != "" {
-			f, err := os.OpenFile(*logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-			if err == nil {
-				logOut = f
-				defer f.Close()
-			}
+		if logSink != nil {
+			logOut = logSink
 		}
 		log.SetOutput(logOut)
 		time.Sleep(400 * time.Millisecond)
@@ -262,6 +272,9 @@ func main() {
 		// Restore stdout and exit cleanly.
 		log.SetOutput(os.Stderr)
 		fmt.Print("\033[0m\n")
+		if logSink != nil {
+			_ = logSink.Flush()
+		}
 	}
 
 	fmt.Println("shutting down")

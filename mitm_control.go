@@ -49,10 +49,11 @@ func (m *MITMController) Set(v bool) { m.on.Store(v) }
 // Commands:
 //
 //	m  — toggle MITM on/off
+//	l  — toggle log file writing on/off (may be nil if no log sink configured)
 //	q  — quit (same as Ctrl+C)
 //
 // Exits when `done` is closed.
-func runKeypressLoop(ctrl *MITMController, done <-chan struct{}) {
+func runKeypressLoop(ctrl *MITMController, sink *LogSink, done <-chan struct{}) {
 	scanner := bufio.NewScanner(os.Stdin)
 	lines := make(chan string)
 	go func() {
@@ -72,7 +73,13 @@ func runKeypressLoop(ctrl *MITMController, done <-chan struct{}) {
 			cmd := strings.ToLower(strings.TrimSpace(line))
 			switch cmd {
 			case "m":
-				ctrl.Toggle()
+				if ctrl != nil {
+					ctrl.Toggle()
+				}
+			case "l":
+				if sink != nil {
+					sink.Toggle()
+				}
 			}
 		}
 	}

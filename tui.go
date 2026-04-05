@@ -38,6 +38,7 @@ type TUIStatus struct {
 	CAInstalled   bool
 	RegFixApplied bool
 	MITMCtrl      *MITMController // live runtime toggle (may be nil)
+	LogSink       *LogSink        // live log-writing toggle (may be nil)
 }
 
 // RunTUI renders a live status view until ctx-like signal arrives.
@@ -185,7 +186,14 @@ func draw(listen string, status TUIStatus, b *Balancer, recent *RecentConns, pre
 	}
 
 	sb.WriteString(ansiDim + strings.Repeat("─", 100) + ansiReset + "\n")
-	sb.WriteString(ansiDim + " Ctrl+C quit   •   type 'm'+Enter to toggle MITM (arm for large downloads)   •   system proxy → 127.0.0.1:1080" + ansiReset + "\n")
+	logOn := status.LogSink != nil && status.LogSink.Enabled()
+	logHint := "'l'+Enter: log OFF"
+	if logOn {
+		logHint = ansiGreen + "'l'+Enter: log ON" + ansiReset + ansiDim
+	} else if status.LogSink == nil {
+		logHint = "'l'+Enter: log n/a"
+	}
+	sb.WriteString(ansiDim + " Ctrl+C quit   •   'm'+Enter: toggle MITM   •   " + logHint + "   •   proxy → 127.0.0.1:1080" + ansiReset + "\n")
 	sb.WriteString(ansiClearDown) // wipe any stale content from previous bigger draw
 
 	// Clear to end of line before every newline so shorter lines overwrite longer previous ones.
