@@ -135,14 +135,22 @@ func main() {
 
 	if status.Admin {
 		applyFMinimizeConnectionsFix()
-		status.RegFixApplied = true
+		status.RegFixApplied = IsFMinimizeConnectionsDisabled()
+		if runtime.GOOS == "windows" && !status.RegFixApplied {
+			fmt.Println("⚠  Could not disable fMinimizeConnections policy (reg add failed).")
+			fmt.Println("   WiFi may be killed when USB tether connects. Check Group Policy settings.")
+		}
 		if !*noMitm {
 			ca, err := LoadOrCreateCA()
 			if err != nil {
 				log.Fatalf("load CA: %v", err)
 			}
 			if !isCAInstalled() {
-				if err := InstallCA(); err == nil {
+				if err := InstallCA(); err != nil {
+					fmt.Printf("⚠  CA install failed: %v\n", err)
+					fmt.Println("   HTTPS interception (single-file splitting) is DISABLED.")
+					fmt.Println("   Retry with: mergenet.exe --install-cert  (as admin)")
+				} else {
 					status.CAInstalled = true
 					pc.Minter = NewMinter(ca)
 				}
@@ -160,15 +168,31 @@ func main() {
 		if !status.CAInstalled && !*noMitm && !*noElevate {
 			if runtime.GOOS == "windows" {
 				fmt.Println("first-time setup: requesting elevation for CA install + WiFi policy fix (UAC prompt)...")
+				fmt.Println("  (click Yes on the UAC dialog; click No and MITM will be disabled)")
 			} else {
 				fmt.Println("first-time setup: CA not installed (single-file splitting disabled).")
 			}
 			if err := ElevateForSetup(); err != nil {
-				fmt.Printf("elevation failed: %v\n", err)
+				fmt.Printf("⚠  Elevation failed: %v\n", err)
+				if runtime.GOOS == "windows" {
+					fmt.Println("   This usually means you clicked No on the UAC prompt.")
+					fmt.Println("   To fix: re-run mergenet.exe and approve UAC,")
+					fmt.Println("           OR run with --no-mitm to skip single-file splitting,")
+					fmt.Println("           OR run: mergenet.exe --install-cert  (as admin, one-time).")
+				}
 			}
 			// Re-check after setup.
 			status.CAInstalled = isCAInstalled()
 			status.RegFixApplied = IsFMinimizeConnectionsDisabled()
+			if !status.CAInstalled {
+				fmt.Println("⚠  CA still not installed after setup attempt — MITM disabled.")
+				fmt.Println("   Single-file downloads will NOT be split. Run --install-cert as admin to retry.")
+			}
+			if runtime.GOOS == "windows" && !status.RegFixApplied {
+				fmt.Println("⚠  fMinimizeConnections policy not applied — WiFi may drop when tether connects.")
+			}
+		} else if !status.CAInstalled && !*noMitm && *noElevate {
+			fmt.Println("note: CA not installed and --no-elevate set → MITM disabled (no single-file splitting).")
 		}
 		// If CA is installed, we can MITM even without admin.
 		if status.CAInstalled && !*noMitm {

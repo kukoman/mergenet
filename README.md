@@ -43,3 +43,7 @@ xattr -d com.apple.quarantine mergenet-macos-arm64
 ```
 
 Or `make release` for all platforms.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
