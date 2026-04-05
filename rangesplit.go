@@ -213,6 +213,25 @@ func bufferSlots(chunkSize int64) int {
 // our own.
 func splitAcrossLinks(w http.ResponseWriter, req *http.Request, hdrs http.Header, d splitDecision, b *Balancer, recent *RecentConns) {
 	healthy := b.HealthyLinks()
+
+	// Verification probe: do a tiny Range: bytes=0-0 to confirm the server's
+	// advertised total. Catches the case where a 200-OK Content-Length lied
+	// (or pointed at a file the server was still writing). One extra RTT,
+	// reuses the existing transport/h2 connection, cheap insurance against
+	// blowing hours on a bad size.
+	if actualTotal, ok := probeTotalSize(req, healthy[0]); ok && actualTotal != d.total {
+		log.Printf("[mitm] split %s%s: probe total=%d differs from advertised=%d — adjusting",
+			req.URL.Host, req.URL.Path, actualTotal, d.total)
+		if d.effEnd >= actualTotal {
+			d.effEnd = actualTotal - 1
+		}
+		if d.effStart >= actualTotal {
+			http.Error(w, "mergenet: requested range beyond actual file size", http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		d.total = actualTotal
+	}
+
 	rangeSize := d.effEnd - d.effStart + 1
 	numChunks := computeChunks(rangeSize, len(healthy))
 	chunkSize := rangeSize / int64(numChunks)
@@ -262,14 +281,52 @@ func splitAcrossLinks(w http.ResponseWriter, req *http.Request, hdrs http.Header
 	}
 
 	// Drain in order. First write failure or fetcher error cancels the rest.
+	var delivered int64
 	for i := 0; i < numChunks; i++ {
-		if err := bufs[i].drainTo(w); err != nil {
-			log.Printf("[mitm] split %s%s: chunk %d drain err=%v (abort)", req.URL.Host, req.URL.Path, i, err)
+		n, err := bufs[i].drainTo(w)
+		delivered += n
+		if err != nil {
+			log.Printf("[mitm] split %s%s: chunk %d drain err=%v — delivered %d/%d bytes (TRUNCATED)",
+				req.URL.Host, req.URL.Path, i, err, delivered, rangeSize)
 			cancel()
 			return
 		}
 	}
 	flushIfPossible(w)
+	if delivered != rangeSize {
+		log.Printf("[mitm] split %s%s: MISMATCH delivered=%d expected=%d (file will be truncated)",
+			req.URL.Host, req.URL.Path, delivered, rangeSize)
+	}
+}
+
+// probeTotalSize asks the server for bytes=0-0 and parses the Content-Range
+// total. Returns (total, true) on success. Used to cross-check an advertised
+// Content-Length before committing to N parallel range requests.
+func probeTotalSize(base *http.Request, link *Link) (int64, bool) {
+	ctx, cancel := context.WithTimeout(base.Context(), 10*time.Second)
+	defer cancel()
+	outReq := base.Clone(ctx)
+	outReq.Method = http.MethodGet
+	outReq.Body = nil
+	outReq.RequestURI = ""
+	outReq.Header = base.Header.Clone()
+	outReq.Header.Set("Range", "bytes=0-0")
+	outReq.Header.Del("Content-Length")
+	client := &http.Client{Transport: linkTransport(link), Timeout: 15 * time.Second}
+	resp, err := client.Do(outReq)
+	if err != nil {
+		return 0, false
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode != http.StatusPartialContent {
+		return 0, false
+	}
+	_, _, total, ok := parseContentRange(resp.Header.Get("Content-Range"))
+	if !ok || total <= 0 {
+		return 0, false
+	}
+	return total, true
 }
 
 // ----- chunkBuf: bounded in-memory byte pipeline --------------------------
@@ -317,20 +374,24 @@ func (c *chunkBuf) getErr() error {
 }
 
 // drainTo writes all pushed slices to w until the fetcher closes the channel.
-// Returns the first write error OR the fetcher error after successful drain.
-func (c *chunkBuf) drainTo(w io.Writer) error {
+// Returns bytes written and the first write error OR the fetcher error after
+// successful drain.
+func (c *chunkBuf) drainTo(w io.Writer) (int64, error) {
+	var written int64
 	for slice := range c.data {
-		if _, err := w.Write(slice); err != nil {
+		n, err := w.Write(slice)
+		written += int64(n)
+		if err != nil {
 			// Drain remaining slices to unblock the fetcher (which may
 			// still be holding on a full channel), then bail.
 			go func() {
 				for range c.data {
 				}
 			}()
-			return err
+			return written, err
 		}
 	}
-	return c.getErr()
+	return written, c.getErr()
 }
 
 // maxChunkAttempts is the per-chunk retry budget. On each failure we switch
@@ -422,6 +483,17 @@ func fetchChunkOnce(ctx context.Context, base *http.Request, link *Link, curStar
 		return fmt.Errorf("status %d", resp.StatusCode)
 	}
 
+	// Cross-check the Content-Range total against our decision's total so a
+	// single lying/wrong server reply can't silently poison the whole download.
+	if cr := resp.Header.Get("Content-Range"); cr != "" {
+		if _, _, total, ok := parseContentRange(cr); ok && total > 0 {
+			if end >= total {
+				return fmt.Errorf("content-range total=%d < requested end=%d (file shorter than advertised)", total, end)
+			}
+		}
+	}
+
+	expected := end - curStart + 1
 	var fetched int64
 	for {
 		slice := make([]byte, readSliceSize)
@@ -440,6 +512,13 @@ func fetchChunkOnce(ctx context.Context, base *http.Request, link *Link, curStar
 		if rerr != nil {
 			return fmt.Errorf("read: %w", rerr)
 		}
+	}
+	// Verify byte count — EOF alone is NOT proof of completion. A short 206
+	// body (server-clamped range, mid-transfer reset silently treated as EOF,
+	// etc.) would otherwise silently truncate the final file.
+	if fetched != expected {
+		return fmt.Errorf("short read: got %d bytes, expected %d (bytes=%d-%d)",
+			fetched, expected, curStart, end)
 	}
 	recent.Add(ConnRecord{Ts: time.Now(), Link: link.Name, Target: fmt.Sprintf("range %d-%d (%d B)", curStart, end, fetched)})
 	return nil
