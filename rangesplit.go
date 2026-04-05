@@ -277,6 +277,7 @@ func splitAcrossLinks(w http.ResponseWriter, req *http.Request, hdrs http.Header
 			end = d.effEnd
 		}
 		link := healthy[i%len(healthy)]
+		log.Printf("[mitm] chunk %d: bytes=%d-%d (%d B) → %s", i, start, end, end-start+1, link.Name)
 		go fetchChunk(ctx, req, b, link, start, end, bufs[i], recent)
 	}
 
@@ -296,6 +297,8 @@ func splitAcrossLinks(w http.ResponseWriter, req *http.Request, hdrs http.Header
 	if delivered != rangeSize {
 		log.Printf("[mitm] split %s%s: MISMATCH delivered=%d expected=%d (file will be truncated)",
 			req.URL.Host, req.URL.Path, delivered, rangeSize)
+	} else {
+		log.Printf("[mitm] split %s%s: DONE delivered=%d bytes", req.URL.Host, req.URL.Path, delivered)
 	}
 }
 
@@ -442,8 +445,11 @@ func fetchChunk(ctx context.Context, base *http.Request, b *Balancer, initial *L
 			log.Printf("[mitm] chunk %d-%d retry %d via %s (pushed=%d)", start, end, attempt, link.Name, pushed)
 		}
 
+		t0 := time.Now()
 		err := fetchChunkOnce(ctx, base, link, start+pushed, end, buf, recent, &pushed)
 		if err == nil {
+			log.Printf("[mitm] chunk %d-%d via %s: OK (%d B in %s)",
+				start, end, link.Name, end-start+1, time.Since(t0).Truncate(time.Millisecond))
 			return // chunk complete
 		}
 		if ctx.Err() != nil {
