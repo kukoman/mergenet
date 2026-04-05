@@ -109,7 +109,7 @@ func forwardOrSplit(w http.ResponseWriter, req *http.Request, b *Balancer, recen
 	}
 	defer releaseLink()
 
-	tr := linkTransport(link)
+	tr := link.Transport()
 
 	outReq := req.Clone(req.Context())
 	outReq.RequestURI = ""
@@ -119,6 +119,22 @@ func forwardOrSplit(w http.ResponseWriter, req *http.Request, b *Balancer, recen
 	stripHopByHop(outReq.Header)
 
 	resp, err := tr.RoundTrip(outReq)
+	// Retry once on a different link if the dial failed with a bind
+	// error (stale source IP from an adapter flap). Bind errors happen
+	// before any request bytes are written, so retry is safe. We only
+	// retry when the request has no body — otherwise we'd need to reset
+	// or re-clone the body, which isn't worth the complexity for the
+	// 99% case (browser GETs, including range requests for media).
+	if err != nil && isBindUnavailable(err) && outReq.Body == nil {
+		log.Printf("[%s] MITM bind failed, retrying on another link: %v", link.Name, err)
+		releaseLink()
+		if next := b.Pick(); next != nil {
+			link = next
+			linkReleased = false
+			tr = link.Transport()
+			resp, err = tr.RoundTrip(outReq)
+		}
+	}
 	if err != nil {
 		http.Error(w, "mergenet: "+err.Error(), http.StatusBadGateway)
 		log.Printf("[%s] MITM forward %s %s failed: %v", link.Name, req.Method, req.URL.Host, err)
@@ -172,11 +188,7 @@ func handleUpgrade(w http.ResponseWriter, req *http.Request, b *Balancer, recent
 	if err != nil {
 		host = req.URL.Host
 	}
-	dialer := &net.Dialer{
-		LocalAddr: &net.TCPAddr{IP: link.LocalIP},
-		Timeout:   10 * time.Second,
-	}
-	rawUp, err := dialer.Dial("tcp", req.URL.Host)
+	rawUp, err := link.NewDialer(10 * time.Second).Dial("tcp", req.URL.Host)
 	if err != nil {
 		http.Error(w, "mergenet: upstream dial failed", http.StatusBadGateway)
 		log.Printf("[%s] MITM upgrade dial %s failed: %v", link.Name, req.URL.Host, err)
@@ -299,46 +311,9 @@ func (c *countingReadCloser) Read(p []byte) (int, error) {
 
 func (c *countingReadCloser) Close() error { return c.rc.Close() }
 
-// ----- per-Link HTTP transport cache ---------------------------------------
-
-var (
-	linkTransportMu sync.RWMutex
-	linkTransports  = map[*Link]*http.Transport{}
-)
-
-// linkTransport returns a cached http.Transport bound to link.LocalIP.
-func linkTransport(link *Link) *http.Transport {
-	linkTransportMu.RLock()
-	if tr, ok := linkTransports[link]; ok {
-		linkTransportMu.RUnlock()
-		return tr
-	}
-	linkTransportMu.RUnlock()
-
-	linkTransportMu.Lock()
-	defer linkTransportMu.Unlock()
-	if tr, ok := linkTransports[link]; ok {
-		return tr
-	}
-	dialer := &net.Dialer{
-		LocalAddr: &net.TCPAddr{IP: link.LocalIP},
-		Timeout:   10 * time.Second,
-		KeepAlive: 30 * time.Second,
-	}
-	tr := &http.Transport{
-		DialContext:           dialer.DialContext,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: 30 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-		IdleConnTimeout:       90 * time.Second,
-		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   16,
-		ForceAttemptHTTP2:     true,
-		DisableCompression:    true, // pass-through client's Accept-Encoding
-	}
-	linkTransports[link] = tr
-	return tr
-}
+// Per-Link HTTP transport resources live in link_net.go (Link.Transport,
+// Link.NewDialer). All call sites below use those methods so every
+// dial re-reads link.LocalIP and stays correct across adapter flaps.
 
 // ----- one-shot listener for InterceptHTTPS --------------------------------
 

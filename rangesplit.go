@@ -438,7 +438,7 @@ func probeTotalSize(base *http.Request, link *Link) (int64, bool) {
 	outReq.Header = base.Header.Clone()
 	outReq.Header.Set("Range", "bytes=0-0")
 	outReq.Header.Del("Content-Length")
-	client := &http.Client{Transport: linkTransport(link), Timeout: 15 * time.Second}
+	client := &http.Client{Transport: link.Transport(), Timeout: 15 * time.Second}
 	resp, err := client.Do(outReq)
 	if err != nil {
 		return 0, false
@@ -696,7 +696,7 @@ func fetchChunkOnce(ctx context.Context, base *http.Request, link *Link, curStar
 	outReq.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", curStart, end))
 	outReq.Header.Del("Content-Length")
 
-	client := &http.Client{Transport: linkTransport(link), Timeout: 0}
+	client := &http.Client{Transport: link.Transport(), Timeout: 0}
 	resp, err := client.Do(outReq)
 	if err != nil {
 		return fmt.Errorf("dial/request: %w", err)

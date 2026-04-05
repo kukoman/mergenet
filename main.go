@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -16,7 +15,7 @@ import (
 	"time"
 )
 
-var Version = "1.2.2"
+var Version = "1.2.3"
 
 const (
 	probeTarget  = "1.1.1.1:53"
@@ -385,17 +384,3 @@ func fatalListenError(addr string, err error) {
 	os.Exit(1)
 }
 
-// isAddrInUse reports whether err represents an EADDRINUSE / WSAEADDRINUSE
-// bind failure, regardless of platform. On Windows the net package surfaces
-// the raw WSA error code (10048) rather than mapping to syscall.EADDRINUSE,
-// so we check both paths.
-func isAddrInUse(err error) bool {
-	if errors.Is(err, syscall.EADDRINUSE) {
-		return true
-	}
-	var errno syscall.Errno
-	if errors.As(err, &errno) {
-		return errno == 10048 // Windows: WSAEADDRINUSE
-	}
-	return false
-}

@@ -171,16 +171,13 @@ func chooseDialer(target string, b *Balancer) *dialChoice {
 	if link == nil {
 		return nil
 	}
-	// LocalIP is a snapshot read from the link at Pick time. It can lag
-	// the adapter's actual state until the next scanOnce cycle — that
-	// lag is what dialLink's retry is designed to tolerate.
+	// link.NewDialer reads link.LocalIP now and dials immediately, so the
+	// source IP is current for this single use. Adapter-flap races are
+	// covered by dialLink's retry.
 	return &dialChoice{
-		dialer: &net.Dialer{
-			LocalAddr: &net.TCPAddr{IP: link.LocalIP},
-			Timeout:   10 * time.Second,
-		},
-		link: link,
-		name: link.Name,
+		dialer: link.NewDialer(10 * time.Second),
+		link:   link,
+		name:   link.Name,
 	}
 }
 

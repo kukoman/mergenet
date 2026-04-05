@@ -60,7 +60,7 @@ func TestChunkRetryResume(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	// Use loopback as LocalIP so linkTransport's Dialer binding works with the
+	// Use loopback as LocalIP so Link.Transport's Dialer binding works with the
 	// httptest server (also on loopback). Two Links with different names so
 	// pickAlternative has a second choice.
 	b := NewBalancer()
