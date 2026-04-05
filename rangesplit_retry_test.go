@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net"
@@ -68,19 +69,18 @@ func TestChunkRetryResume(t *testing.T) {
 
 	baseReq, _ := http.NewRequest("GET", srv.URL, nil)
 	buf := newChunkBuf(100)
+	defer buf.close()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go fetchChunk(ctx, baseReq, b, b.HealthyLinks()[0], chunkStart, chunkEnd, buf, NewRecentConns(16))
 
-	// Drain the buffer into one byte slice and verify.
-	var got []byte
-	for slice := range buf.data {
-		got = append(got, slice...)
-	}
-	if err := buf.getErr(); err != nil {
+	// Drain the spool into a byte slice and verify.
+	var sink bytes.Buffer
+	if _, err := buf.drainTo(&sink); err != nil {
 		t.Fatalf("fetchChunk error: %v", err)
 	}
+	got := sink.Bytes()
 	want := chunkEnd - chunkStart + 1
 	if int64(len(got)) != want {
 		t.Fatalf("got %d bytes, want %d", len(got), want)

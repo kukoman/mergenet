@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -334,17 +335,16 @@ func TestSplitShortReadDetected(t *testing.T) {
 
 	baseReq, _ := http.NewRequest("GET", srv.URL, nil)
 	buf := newChunkBuf(100)
+	defer buf.close()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go fetchChunk(ctx, baseReq, b, b.HealthyLinks()[0], chunkStart, chunkEnd, buf, NewRecentConns(16))
 
-	var got []byte
-	for slice := range buf.data {
-		got = append(got, slice...)
-	}
-	if err := buf.getErr(); err != nil {
+	var sink bytes.Buffer
+	if _, err := buf.drainTo(&sink); err != nil {
 		t.Fatalf("fetchChunk error: %v", err)
 	}
+	got := sink.Bytes()
 	want := chunkEnd - chunkStart + 1
 	if int64(len(got)) != want {
 		t.Fatalf("got %d bytes, want %d (short-read check should have triggered retry)", len(got), want)

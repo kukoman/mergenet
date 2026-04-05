@@ -6,8 +6,10 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -61,10 +63,12 @@ func shouldSplit(req *http.Request, resp *http.Response, b *Balancer) (splitDeci
 	if req.Method != http.MethodGet {
 		return d, false
 	}
-	if len(b.HealthyLinks()) < 2 {
-		return d, false
-	}
 
+	// Determine effective range + size first, so we only log rejection
+	// reasons for responses that WERE size candidates. Silently skipping
+	// a multi-hundred-MB download is the #1 "WTF why didn't it split"
+	// case — logging the specific header that killed the decision lets
+	// you point a finger at the server or your config immediately.
 	switch resp.StatusCode {
 	case http.StatusOK:
 		if resp.ContentLength <= 0 {
@@ -90,20 +94,50 @@ func shouldSplit(req *http.Request, resp *http.Response, b *Balancer) (splitDeci
 	if rangeSize < rangeSplitThreshold {
 		return d, false
 	}
+
+	// From here on the response is a size candidate (>= threshold). Any
+	// further rejection gets logged so the user can see WHY their big
+	// download stayed on one link.
+	logReject := func(reason string) {
+		log.Printf("[mitm] no-split %s%s: %s (size=%s)",
+			req.URL.Host, req.URL.Path, reason, humanBytes(rangeSize))
+	}
+
+	if healthy := b.HealthyLinks(); len(healthy) < 2 {
+		logReject(fmt.Sprintf("only %d healthy link(s)", len(healthy)))
+		return d, false
+	}
 	// Range support signal:
 	//   - 200 response: require Accept-Ranges: bytes (server hasn't proven it yet)
 	//   - 206 response: implicit (server just honored a Range request)
 	if resp.StatusCode == http.StatusOK &&
 		!strings.EqualFold(resp.Header.Get("Accept-Ranges"), "bytes") {
+		logReject(fmt.Sprintf("no Accept-Ranges: bytes (got %q)", resp.Header.Get("Accept-Ranges")))
 		return d, false
 	}
 	if enc := resp.Header.Get("Content-Encoding"); enc != "" && !strings.EqualFold(enc, "identity") {
+		logReject(fmt.Sprintf("Content-Encoding=%q (cannot reassemble compressed body)", enc))
 		return d, false
 	}
-	if isStreamingContentType(strings.ToLower(resp.Header.Get("Content-Type"))) {
+	if ct := strings.ToLower(resp.Header.Get("Content-Type")); isStreamingContentType(ct) {
+		logReject(fmt.Sprintf("streaming Content-Type=%q", ct))
 		return d, false
 	}
 	return d, true
+}
+
+// humanBytes renders a byte count as a compact human-readable string
+// (e.g. "42.3MB"). Used only in logs — never parsed.
+func humanBytes(n int64) string {
+	switch {
+	case n >= 1024*1024*1024:
+		return fmt.Sprintf("%.1fGB", float64(n)/(1024*1024*1024))
+	case n >= 1024*1024:
+		return fmt.Sprintf("%.1fMB", float64(n)/(1024*1024))
+	case n >= 1024:
+		return fmt.Sprintf("%.1fKB", float64(n)/1024)
+	}
+	return fmt.Sprintf("%dB", n)
 }
 
 // isStreamingContentType matches content-types where parallel range chunks
@@ -152,37 +186,43 @@ func parseContentRange(cr string) (start, end, total int64, ok bool) {
 	return s, e, t, true
 }
 
-// computeChunks picks a chunk count based on the byte range size and the
-// number of healthy links. Rule of thumb: more streams on bigger files
-// to overcome per-flow throughput caps on mobile/tether links.
+// chunkTargetSize is the nominal per-chunk size. Small enough that a fast
+// link naturally pulls more chunks than a slow link off the shared work
+// queue (self-balancing under asymmetric link speeds); large enough to
+// amortize HTTP/range-request overhead and keep the number of temp spool
+// files manageable.
+const chunkTargetSize = 32 * 1024 * 1024 // 32 MB
+
+// maxChunks caps the number of chunks (and therefore temp files) for very
+// large downloads. For a 100 GB download this yields chunks of ~200 MB
+// instead of 3200 tiny files.
+const maxChunks = 512
+
+// workersPerLink is the number of concurrent range-fetcher goroutines we
+// run per healthy link. Each worker pulls chunks from the shared queue.
+// 4 is a pragmatic compromise: enough parallelism per link to saturate a
+// typical mobile/tether connection, few enough to avoid per-host connection
+// limits or server-side rate-limits.
+const workersPerLink = 4
+
+// computeChunks picks a chunk count based on the byte range size. Target a
+// fixed ~32 MB per chunk so we get many chunks — more chunks means finer-
+// grained work-stealing on the shared queue, which is what lets a fast link
+// naturally take ~2x the work of a slow link without any explicit weighting.
 //
-//	< 50 MB        -> 1 stream per link
-//	< 500 MB       -> 2 streams per link
-//	>= 500 MB      -> 4 streams per link
-//
-// Clamped to [2, 16] and constrained so each chunk is at least 2 MB.
+// Minimum of 2 (must be splittable), maximum of maxChunks (bounds temp-file
+// count for huge downloads).
 func computeChunks(size int64, numLinks int) int {
-	if numLinks < 1 {
-		numLinks = 1
+	_ = numLinks // unused; kept for call-site compat
+	n := int(size / chunkTargetSize)
+	if size%chunkTargetSize != 0 {
+		n++
 	}
-	perLink := 1
-	switch {
-	case size >= 500*1024*1024:
-		perLink = 4
-	case size >= 50*1024*1024:
-		perLink = 2
-	}
-	n := numLinks * perLink
 	if n < 2 {
 		n = 2
 	}
-	if n > 16 {
-		n = 16
-	}
-	// Ensure each chunk is >= 2 MB to avoid tiny-chunk overhead.
-	const minChunkBytes = 2 * 1024 * 1024
-	for n > 2 && size/int64(n) < minChunkBytes {
-		n--
+	if n > maxChunks {
+		n = maxChunks
 	}
 	return n
 }
@@ -237,8 +277,29 @@ func splitAcrossLinks(w http.ResponseWriter, req *http.Request, hdrs http.Header
 	chunkSize := rangeSize / int64(numChunks)
 	slots := bufferSlots(chunkSize)
 
-	log.Printf("[mitm] split %s%s: bytes %d-%d/%d (%d B) in %d chunks over %d links (buf=%dx%dKB/chunk)",
-		req.URL.Host, req.URL.Path, d.effStart, d.effEnd, d.total, rangeSize, numChunks, len(healthy), slots, readSliceSize/1024)
+	// Snapshot per-link byte counters so we can report the delta at the
+	// end — answers "was the download actually spread across both links?"
+	// at a single glance without cross-referencing the TUI.
+	t0 := time.Now()
+	byteSnapshot := make(map[string]int64, len(healthy))
+	linkNames := make([]string, 0, len(healthy))
+	for _, l := range healthy {
+		byteSnapshot[l.Name] = atomic.LoadInt64(&l.BytesIn)
+		linkNames = append(linkNames, l.Name)
+	}
+	perLinkSummary := func() string {
+		parts := make([]string, 0, len(healthy))
+		for _, l := range healthy {
+			delta := atomic.LoadInt64(&l.BytesIn) - byteSnapshot[l.Name]
+			parts = append(parts, fmt.Sprintf("%s=%s", l.Name, humanBytes(delta)))
+		}
+		return strings.Join(parts, " ")
+	}
+
+	log.Printf("[mitm] split %s%s: bytes %d-%d/%d (%s) in %d chunks (~%s each) over %d links [%s] %d workers/link",
+		req.URL.Host, req.URL.Path, d.effStart, d.effEnd, d.total, humanBytes(rangeSize),
+		numChunks, humanBytes(chunkSize), len(healthy), strings.Join(linkNames, ","), workersPerLink)
+	_ = slots
 
 	// Copy upstream headers minus hop-by-hop and length/range we override.
 	for k, vs := range hdrs {
@@ -270,16 +331,70 @@ func splitAcrossLinks(w http.ResponseWriter, req *http.Request, hdrs http.Header
 	for i := range bufs {
 		bufs[i] = newChunkBuf(slots)
 	}
-	for i := 0; i < numChunks; i++ {
-		start := d.effStart + int64(i)*chunkSize
-		end := start + chunkSize - 1
-		if i == numChunks-1 {
-			end = d.effEnd
+	// Ensure temp files are removed no matter how we exit (success, client
+	// disconnect, fetcher error). close() also wakes any blocked drainTo.
+	defer func() {
+		for _, b := range bufs {
+			b.close()
 		}
-		link := healthy[i%len(healthy)]
-		log.Printf("[mitm] chunk %d: bytes=%d-%d (%d B) → %s", i, start, end, end-start+1, link.Name)
-		go fetchChunk(ctx, req, b, link, start, end, bufs[i], recent)
+	}()
+	// Precompute each chunk's byte range. We do NOT pre-assign a link —
+	// chunks sit in a shared work queue and any worker on any link may
+	// claim them. This is the key to handling asymmetric link speeds: a
+	// 2x-faster link naturally pulls ~2x more chunks off the queue than
+	// a slow link, so both links finish at roughly the same time instead
+	// of the fast link going idle after its pre-assigned share.
+	starts := make([]int64, numChunks)
+	ends := make([]int64, numChunks)
+	for i := 0; i < numChunks; i++ {
+		starts[i] = d.effStart + int64(i)*chunkSize
+		ends[i] = starts[i] + chunkSize - 1
+		if i == numChunks-1 {
+			ends[i] = d.effEnd
+		}
 	}
+
+	// Work queue. Pre-filled with every chunk index; workers range-read
+	// until empty. Close happens after the loop below enqueues all indices.
+	queue := make(chan int, numChunks)
+	for i := 0; i < numChunks; i++ {
+		queue <- i
+	}
+	close(queue)
+
+	// Per-link worker pool. Each worker is PERMANENTLY bound to its link
+	// (no chunk migration between links), so once a chunk is claimed by a
+	// worker on linkX it is fetched via linkX with retries on that same
+	// link. If the link is completely dead, fetchChunk exhausts its
+	// attempts, cancel() fires, and the drain bails with an error — we do
+	// not silently re-route the chunk to the other link and collapse the
+	// split to a single link's throughput.
+	var fetcherErr atomic.Value // first worker error, for logging
+	var wg sync.WaitGroup
+	for _, link := range healthy {
+		for w := 0; w < workersPerLink; w++ {
+			wg.Add(1)
+			go func(link *Link, workerID int) {
+				defer wg.Done()
+				for idx := range queue {
+					if ctx.Err() != nil {
+						return
+					}
+					fetchChunk(ctx, req, b, link, starts[idx], ends[idx], bufs[idx], recent)
+					// fetchChunk stores its own terminal error in the
+					// spool's err field; drainTo surfaces it. We also
+					// record the FIRST error here just for logging.
+					if e := bufs[idx].getErr(); e != nil && fetcherErr.Load() == nil {
+						fetcherErr.Store(e)
+					}
+				}
+			}(link, w)
+		}
+	}
+	// When all workers exit (queue drained + all in-flight chunks done or
+	// failed), we're done producing. The drain goroutine may still be
+	// streaming — it exits on its own when it reaches the last chunk.
+	go func() { wg.Wait() }()
 
 	// Drain in order. First write failure or fetcher error cancels the rest.
 	var delivered int64
@@ -287,18 +402,26 @@ func splitAcrossLinks(w http.ResponseWriter, req *http.Request, hdrs http.Header
 		n, err := bufs[i].drainTo(w)
 		delivered += n
 		if err != nil {
-			log.Printf("[mitm] split %s%s: chunk %d drain err=%v — delivered %d/%d bytes (TRUNCATED)",
-				req.URL.Host, req.URL.Path, i, err, delivered, rangeSize)
+			log.Printf("[mitm] split %s%s: chunk %d drain err=%v — delivered %s/%s in %s — per-link %s (TRUNCATED)",
+				req.URL.Host, req.URL.Path, i, err, humanBytes(delivered), humanBytes(rangeSize),
+				time.Since(t0).Truncate(time.Millisecond), perLinkSummary())
 			cancel()
 			return
 		}
 	}
 	flushIfPossible(w)
+	elapsed := time.Since(t0).Truncate(time.Millisecond)
+	rate := "-"
+	if secs := elapsed.Seconds(); secs > 0.01 {
+		rate = fmt.Sprintf("%.1fMB/s", float64(delivered)/(1024*1024)/secs)
+	}
 	if delivered != rangeSize {
-		log.Printf("[mitm] split %s%s: MISMATCH delivered=%d expected=%d (file will be truncated)",
-			req.URL.Host, req.URL.Path, delivered, rangeSize)
+		log.Printf("[mitm] split %s%s: MISMATCH delivered=%s expected=%s in %s @ %s — per-link %s (file will be truncated)",
+			req.URL.Host, req.URL.Path, humanBytes(delivered), humanBytes(rangeSize),
+			elapsed, rate, perLinkSummary())
 	} else {
-		log.Printf("[mitm] split %s%s: DONE delivered=%d bytes", req.URL.Host, req.URL.Path, delivered)
+		log.Printf("[mitm] split %s%s: DONE delivered=%s in %s @ %s — per-link %s",
+			req.URL.Host, req.URL.Path, humanBytes(delivered), elapsed, rate, perLinkSummary())
 	}
 }
 
@@ -332,108 +455,203 @@ func probeTotalSize(base *http.Request, link *Link) (int64, bool) {
 	return total, true
 }
 
-// ----- chunkBuf: bounded in-memory byte pipeline --------------------------
+// ----- chunkBuf: disk-spooled byte pipeline -------------------------------
 
 // chunkBuf carries bytes from one chunk's fetcher to the drain goroutine
-// via a bounded buffered channel. Fetcher owns the writer end, drain owns
-// the reader end. The channel's capacity imposes backpressure — when full,
-// the fetcher blocks until drain consumes slices. No disk, no polling.
+// via a temp file. Fetcher appends to the file, drain reads from it (via a
+// separate fd) and streams to the client. A sync.Cond signals "new bytes
+// available" / "fetcher finished".
+//
+// Why disk instead of a bounded in-memory channel? The drain writes chunks
+// to the client in strict order (0, 1, 2, ...), so with an in-memory cap
+// every non-head chunk is bottlenecked at (cap) bytes regardless of how fast
+// its link can fetch. For multi-GB downloads that causes head-of-line
+// blocking: only one chunk makes progress at a time, and each link alternates
+// between active and idle instead of both running at full speed.
+//
+// With a disk spool the fetcher is never blocked on back-pressure from the
+// drain, so every chunk on every link keeps downloading at full link speed.
+// The caller (splitAcrossLinks) is responsible for calling close() to remove
+// the temp file.
 type chunkBuf struct {
-	data chan []byte  // nil-terminated by close(data)
-	err  atomic.Value // stored as error on fetcher failure
+	writeF *os.File // append-only write fd
+	readF  *os.File // separate read fd, advances independently
+	path   string   // temp file path (for cleanup)
+
+	mu      sync.Mutex
+	cond    *sync.Cond
+	written int64 // total bytes appended by fetcher
+	done    bool  // fetcher called finish()
+	err     error // fetcher's terminal error, if any
+	closed  bool  // close() was called; drain should exit
 }
 
+// newChunkBuf creates a new disk-backed spool. The slots parameter is kept
+// for API compatibility but ignored — the spool is bounded by disk, not RAM.
 func newChunkBuf(slots int) *chunkBuf {
-	if slots < 2 {
-		slots = 2
-	}
-	return &chunkBuf{data: make(chan []byte, slots)}
-}
-
-// push sends a slice to the drain goroutine, or returns ctx.Err() if cancelled.
-// The slice must not be reused by the caller after push returns nil.
-func (c *chunkBuf) push(ctx context.Context, p []byte) error {
-	select {
-	case c.data <- p:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
-// setErr stores the fetcher's terminal error. Called before close(c.data).
-func (c *chunkBuf) setErr(err error) {
+	_ = slots
+	f, err := os.CreateTemp("", "mergenet-chunk-*.tmp")
 	if err != nil {
-		c.err.Store(err)
+		panic(fmt.Sprintf("mergenet: create temp spool: %v", err))
 	}
+	rf, err := os.OpenFile(f.Name(), os.O_RDONLY, 0)
+	if err != nil {
+		f.Close()
+		os.Remove(f.Name())
+		panic(fmt.Sprintf("mergenet: open temp spool for read: %v", err))
+	}
+	c := &chunkBuf{writeF: f, readF: rf, path: f.Name()}
+	c.cond = sync.NewCond(&c.mu)
+	return c
 }
 
-// getErr returns the stored fetcher error, or nil.
-func (c *chunkBuf) getErr() error {
-	if v := c.err.Load(); v != nil {
-		return v.(error)
+// push appends p to the spool. Returns ctx.Err() if context is cancelled.
+func (c *chunkBuf) push(ctx context.Context, p []byte) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	n, werr := c.writeF.Write(p)
+	if n > 0 {
+		c.mu.Lock()
+		c.written += int64(n)
+		c.mu.Unlock()
+		c.cond.Broadcast()
+	}
+	if werr != nil {
+		return fmt.Errorf("spool write: %w", werr)
 	}
 	return nil
 }
 
-// drainTo writes all pushed slices to w until the fetcher closes the channel.
-// Returns bytes written and the first write error OR the fetcher error after
-// successful drain.
-func (c *chunkBuf) drainTo(w io.Writer) (int64, error) {
-	var written int64
-	for slice := range c.data {
-		n, err := w.Write(slice)
-		written += int64(n)
-		if err != nil {
-			// Drain remaining slices to unblock the fetcher (which may
-			// still be holding on a full channel), then bail.
-			go func() {
-				for range c.data {
-				}
-			}()
-			return written, err
-		}
+// finish signals that the fetcher has stopped producing data. Must be called
+// exactly once by fetchChunk at the end of its lifetime.
+func (c *chunkBuf) finish(err error) {
+	c.mu.Lock()
+	c.done = true
+	if err != nil && c.err == nil {
+		c.err = err
 	}
-	return written, c.getErr()
+	c.mu.Unlock()
+	c.cond.Broadcast()
 }
 
-// maxChunkAttempts is the per-chunk retry budget. On each failure we switch
-// to a different healthy link (if available) and resume from the last byte
-// we successfully pushed downstream.
+// setErr / getErr preserved for test compatibility.
+func (c *chunkBuf) setErr(err error) {
+	c.mu.Lock()
+	if err != nil {
+		c.err = err
+	}
+	c.mu.Unlock()
+}
+func (c *chunkBuf) getErr() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.err
+}
+
+// drainTo streams the spool to w, blocking until the fetcher finishes.
+// Returns bytes delivered and the first write error OR the fetcher's
+// terminal error after a successful drain.
+func (c *chunkBuf) drainTo(w io.Writer) (int64, error) {
+	var delivered int64
+	rbuf := make([]byte, 128*1024)
+	for {
+		c.mu.Lock()
+		for c.written == delivered && !c.done && !c.closed {
+			c.cond.Wait()
+		}
+		avail := c.written - delivered
+		done := c.done
+		closed := c.closed
+		terr := c.err
+		c.mu.Unlock()
+
+		if closed {
+			return delivered, fmt.Errorf("spool closed")
+		}
+
+		for avail > 0 {
+			toRead := int64(len(rbuf))
+			if toRead > avail {
+				toRead = avail
+			}
+			n, rerr := c.readF.Read(rbuf[:toRead])
+			if n > 0 {
+				nw, werr := w.Write(rbuf[:n])
+				delivered += int64(nw)
+				avail -= int64(n)
+				if werr != nil {
+					return delivered, werr
+				}
+				if nw != n {
+					return delivered, io.ErrShortWrite
+				}
+			}
+			if rerr != nil {
+				return delivered, fmt.Errorf("spool read: %w", rerr)
+			}
+		}
+
+		if done {
+			// Re-check written under lock: fetcher may have appended more
+			// right before calling finish().
+			c.mu.Lock()
+			final := c.written
+			c.mu.Unlock()
+			if delivered >= final {
+				return delivered, terr
+			}
+			// Loop again; there are more bytes to drain.
+		}
+	}
+}
+
+// close releases spool resources and deletes the temp file. Safe to call
+// concurrently with a blocked drainTo — it will wake drain with an error.
+func (c *chunkBuf) close() {
+	c.mu.Lock()
+	c.closed = true
+	c.mu.Unlock()
+	c.cond.Broadcast()
+	c.writeF.Close()
+	c.readF.Close()
+	os.Remove(c.path)
+}
+
+// maxChunkAttempts is the per-chunk retry budget. A retry opens a fresh TCP
+// connection on the SAME link and resumes from the last byte we successfully
+// pushed downstream. We deliberately do NOT migrate the chunk to the other
+// link: transient failures (h2 GOAWAY, idle-kill, mid-body RST, server short
+// response) are almost always fixed by a fresh connection on the same
+// interface, and staying put preserves the per-chunk link assignment so
+// parallel downloads actually use BOTH interfaces instead of collapsing to
+// whichever link answers retries fastest.
 const maxChunkAttempts = 5
 
 // fetchChunk GETs bytes=start-end from upstream and pushes read slices into
-// buf. Resilient to mid-transfer failures: tracks bytes pushed, on TCP error
-// it re-issues Range: bytes=(start+pushed)-(end) on a different healthy link
-// and continues. The drainer never sees the retry — bytes arrive in order.
+// buf. Resilient to mid-transfer failures: tracks bytes pushed, on error it
+// re-issues Range: bytes=(start+pushed)-(end) on the SAME link and continues.
+// The drainer never sees the retry — bytes arrive in order.
 //
 // Bounded by maxChunkAttempts; beyond that the chunk fails and the whole
 // download aborts (client gets a truncated body unless it resumes).
 func fetchChunk(ctx context.Context, base *http.Request, b *Balancer, initial *Link, start, end int64, buf *chunkBuf, recent *RecentConns) {
 	var terminalErr error
 	defer func() {
-		buf.setErr(terminalErr)
-		close(buf.data)
+		buf.finish(terminalErr)
 	}()
 
 	// Pushed = total bytes successfully handed to drain so far. Always
 	// restart from (start + pushed).
 	var pushed int64
 	link := initial
-	lastFailed := (*Link)(nil)
 
 	for attempt := 0; attempt < maxChunkAttempts; attempt++ {
 		if ctx.Err() != nil {
 			terminalErr = ctx.Err()
 			return
 		}
-		// On retry, switch to any healthy link that isn't the one that just failed.
 		if attempt > 0 {
-			link = pickAlternative(b, lastFailed)
-			if link == nil {
-				terminalErr = fmt.Errorf("chunk %d-%d: no healthy links left after %d attempts", start, end, attempt)
-				return
-			}
 			// Exponential backoff: 100ms, 200ms, 400ms, 800ms
 			delay := time.Duration(100*(1<<uint(attempt-1))) * time.Millisecond
 			select {
@@ -456,10 +674,9 @@ func fetchChunk(ctx context.Context, base *http.Request, b *Balancer, initial *L
 			terminalErr = ctx.Err()
 			return
 		}
-		lastFailed = link
 		log.Printf("[mitm] chunk %d-%d via %s failed (pushed=%d/%d): %v", start, end, link.Name, pushed, end-start+1, err)
 	}
-	terminalErr = fmt.Errorf("chunk %d-%d: exhausted %d attempts", start, end, maxChunkAttempts)
+	terminalErr = fmt.Errorf("chunk %d-%d: exhausted %d attempts on %s", start, end, maxChunkAttempts, link.Name)
 }
 
 // fetchChunkOnce does one attempt at fetching [curStart, end] via link.
@@ -530,18 +747,3 @@ func fetchChunkOnce(ctx context.Context, base *http.Request, link *Link, curStar
 	return nil
 }
 
-// pickAlternative returns any healthy link that isn't `avoid`. Falls back to
-// `avoid` itself if it's the only remaining healthy link (better to retry
-// there than give up). Returns nil if nothing is healthy.
-func pickAlternative(b *Balancer, avoid *Link) *Link {
-	healthy := b.HealthyLinks()
-	if len(healthy) == 0 {
-		return nil
-	}
-	for _, l := range healthy {
-		if l != avoid {
-			return l
-		}
-	}
-	return healthy[0] // only `avoid` is healthy — retry on it anyway
-}
