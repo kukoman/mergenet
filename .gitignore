@@ -1,5 +1,9 @@
 mergenet
 mergenet.exe
+mergenet-macos-*
+mergenet-linux-*
+dist/
 *.test
+*.log
 .vscode/
 .idea/
