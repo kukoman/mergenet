@@ -36,12 +36,12 @@ jobs:
           CGO_ENABLED: 0
         run: |
           go build -ldflags="-s -w -X main.Version=${GITHUB_REF_NAME#v}" \
-            -o mergenet-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }} .
+            -o mergenet-${GITHUB_REF_NAME}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }} .
 
       - uses: actions/upload-artifact@v4
         with:
-          name: mergenet-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: mergenet-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
+          name: mergenet-${{ github.ref_name }}-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: mergenet-${{ github.ref_name }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
           retention-days: 1
 
   release:
