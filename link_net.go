@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"log"
 	"net"
 	"net/http"
 	"sync"
 	"time"
+
+	"golang.org/x/net/http2"
 )
 
 // link_net.go — per-Link networking resources.
@@ -96,6 +99,18 @@ func (l *Link) Transport() *http.Transport {
 		MaxIdleConnsPerHost:   16,
 		ForceAttemptHTTP2:     true,
 		DisableCompression:    true, // pass-through client's Accept-Encoding
+	}
+	// Enable HTTP/2 PING-based health checking so idle connections
+	// that died (server GOAWAY, network blip) are detected and evicted
+	// before a real request hangs on them until ResponseHeaderTimeout.
+	// Without this, OAuth callbacks after a long auth page visit hit
+	// "http2: timeout awaiting response headers" on stale connections.
+	h2t, err := http2.ConfigureTransports(tr)
+	if err != nil {
+		log.Printf("[%s] http2.ConfigureTransports: %v (falling back to auto-h2)", l.Name, err)
+	} else {
+		h2t.ReadIdleTimeout = 10 * time.Second // send PING after 10s idle
+		h2t.PingTimeout = 5 * time.Second      // close conn if no PONG within 5s
 	}
 	linkTransports[l] = tr
 	return tr
