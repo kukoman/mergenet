@@ -67,6 +67,9 @@ func (s *LinkScorer) RecordSample(link *Link, bytes int64, dur time.Duration) {
 // Cold-start links (< coldStartThreshold samples) use probe latency as
 // a stand-in. Returns 0 if the link has never been sampled and has no
 // probe latency.
+//
+// Reads link.ProbeLatency without Balancer.mu — safe because Score is
+// only called from Balancer.Pick (and tests), which holds mu.
 func (s *LinkScorer) Score(link *Link) float64 {
 	s.mu.Lock()
 	st := s.stats[link]

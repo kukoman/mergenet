@@ -1,11 +1,15 @@
 package main
 
 import (
+	"math/rand"
 	"net"
 	"sync"
 	"sync/atomic"
 	"time"
 )
+
+// randFloat64 returns a random float in [0, 1). Extracted for testing.
+var randFloat64 = rand.Float64
 
 // Link holds per-interface state. Mutable scalar fields (Healthy, LocalIP,
 // ProbeLatency, Weight) are ONLY accessed under Balancer.mu. Counter fields
@@ -37,9 +41,10 @@ type LinkView struct {
 }
 
 type Balancer struct {
-	mu    sync.Mutex
-	links []*Link
-	next  int
+	mu     sync.Mutex
+	links  []*Link
+	next   int
+	scorer *LinkScorer
 }
 
 func NewBalancer() *Balancer {
@@ -132,13 +137,24 @@ func (b *Balancer) SnapshotView() []LinkView {
 	return out
 }
 
-// Pick returns a healthy link via weighted round-robin, or nil if no healthy
-// links exist. Atomically increments the chosen link's connection counters.
-// Caller MUST decrement ActiveConns when the connection ends.
+// Pick returns a healthy link, or nil if none exist. When a LinkScorer is
+// set, selects the highest-scoring link (throughput-aware). Falls back to
+// weighted round-robin when no scorer is configured. Atomically increments
+// the chosen link's connection counters. Caller MUST decrement ActiveConns
+// when the connection ends.
 func (b *Balancer) Pick() *Link {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	// Build round-robin slice: each healthy link appears Weight times.
+
+	if b.scorer == nil {
+		return b.pickRoundRobin()
+	}
+	return b.pickByScore()
+}
+
+// pickRoundRobin is the original weighted round-robin selection. Used as
+// fallback when no scorer is configured.
+func (b *Balancer) pickRoundRobin() *Link {
 	var total int
 	for _, l := range b.links {
 		if l.Healthy {
@@ -154,7 +170,6 @@ func (b *Balancer) Pick() *Link {
 	}
 	idx := b.next % total
 	b.next++
-	// Walk weighted slots without allocating.
 	for _, l := range b.links {
 		if !l.Healthy {
 			continue
@@ -170,5 +185,52 @@ func (b *Balancer) Pick() *Link {
 		}
 		idx -= w
 	}
-	return nil // unreachable
+	return nil
+}
+
+// pickByScore selects the healthy link with the highest scorer.Score().
+// If any healthy link is stale, it is picked with exploreProb probability
+// to refresh its EWMA.
+func (b *Balancer) pickByScore() *Link {
+	// Collect healthy links.
+	healthy := make([]*Link, 0, len(b.links))
+	for _, l := range b.links {
+		if l.Healthy {
+			healthy = append(healthy, l)
+		}
+	}
+	if len(healthy) == 0 {
+		return nil
+	}
+	if len(healthy) == 1 {
+		l := healthy[0]
+		atomic.AddInt64(&l.ActiveConns, 1)
+		atomic.AddInt64(&l.TotalConns, 1)
+		return l
+	}
+
+	// Exploration: if any link is stale, maybe pick it.
+	for _, l := range healthy {
+		if b.scorer.IsStale(l) && randFloat64() < exploreProb {
+			atomic.AddInt64(&l.ActiveConns, 1)
+			atomic.AddInt64(&l.TotalConns, 1)
+			return l
+		}
+	}
+
+	// Exploitation: pick highest score.
+	var best *Link
+	bestScore := -1.0
+	for _, l := range healthy {
+		sc := b.scorer.Score(l)
+		if sc > bestScore {
+			bestScore = sc
+			best = l
+		}
+	}
+	if best != nil {
+		atomic.AddInt64(&best.ActiveConns, 1)
+		atomic.AddInt64(&best.TotalConns, 1)
+	}
+	return best
 }
