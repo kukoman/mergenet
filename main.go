@@ -73,7 +73,9 @@ func main() {
 
 	fmt.Printf("mergenet v%s starting\n", Version)
 
+	scorer := NewLinkScorer()
 	balancer := NewBalancer()
+	balancer.scorer = scorer
 	recent := NewRecentConns(200)
 
 	// Initial discovery (visible in normal stdout before TUI takes over).
@@ -131,7 +133,7 @@ func main() {
 	// else normally (including WebSockets, which get raw-spliced). User can
 	// still toggle MITM off at runtime via 'm'+Enter if needed.
 	mitmCtrl := NewMITMController()
-	pc := &ProxyConfig{Balancer: balancer, Recent: recent, MITMCtrl: mitmCtrl}
+	pc := &ProxyConfig{Balancer: balancer, Scorer: scorer, Recent: recent, MITMCtrl: mitmCtrl}
 	status := TUIStatus{Admin: IsAdmin(), MITMCtrl: mitmCtrl}
 
 	if status.Admin {
@@ -269,7 +271,7 @@ func main() {
 		}
 		log.SetOutput(logOut)
 		time.Sleep(400 * time.Millisecond)
-		RunTUI(listenAddr, status, balancer, recent, done)
+		RunTUI(listenAddr, status, balancer, scorer, recent, done)
 		// Restore stdout and exit cleanly.
 		log.SetOutput(os.Stderr)
 		fmt.Print("\033[0m\n")

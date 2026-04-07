@@ -95,6 +95,15 @@ func (s *LinkScorer) Score(link *Link) float64 {
 	return throughput / float64(1+activeConns)
 }
 
+// ScoreSnapshot returns a map of link name → current score for display.
+func (s *LinkScorer) ScoreSnapshot(links []*Link) map[string]float64 {
+	out := make(map[string]float64, len(links))
+	for _, l := range links {
+		out[l.Name] = s.Score(l)
+	}
+	return out
+}
+
 // IsStale reports whether the link's EWMA data is older than staleThreshold.
 func (s *LinkScorer) IsStale(link *Link) bool {
 	s.mu.Lock()

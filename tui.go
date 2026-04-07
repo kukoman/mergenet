@@ -43,12 +43,12 @@ type TUIStatus struct {
 
 // RunTUI renders a live status view until ctx-like signal arrives.
 // Blocks until os.Interrupt is received via sigCh.
-func RunTUI(listen string, status TUIStatus, b *Balancer, recent *RecentConns, sigCh <-chan struct{}) {
+func RunTUI(listen string, status TUIStatus, b *Balancer, scorer *LinkScorer, recent *RecentConns, sigCh <-chan struct{}) {
 	prev := map[string]linkSnap{}
 	prevTime := time.Now()
 
 	// First draw
-	draw(listen, status, b, recent, prev, 0)
+	draw(listen, status, b, scorer, recent, prev, 0)
 
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
@@ -61,7 +61,7 @@ func RunTUI(listen string, status TUIStatus, b *Balancer, recent *RecentConns, s
 			if dt <= 0 {
 				dt = 1
 			}
-			draw(listen, status, b, recent, prev, dt)
+			draw(listen, status, b, scorer, recent, prev, dt)
 			// Update prev snapshot for next tick
 			prev = map[string]linkSnap{}
 			for _, v := range b.SnapshotView() {
@@ -72,7 +72,7 @@ func RunTUI(listen string, status TUIStatus, b *Balancer, recent *RecentConns, s
 	}
 }
 
-func draw(listen string, status TUIStatus, b *Balancer, recent *RecentConns, prev map[string]linkSnap, dt float64) {
+func draw(listen string, status TUIStatus, b *Balancer, scorer *LinkScorer, recent *RecentConns, prev map[string]linkSnap, dt float64) {
 	var sb strings.Builder
 	sb.WriteString(ansiHome)
 
@@ -110,6 +110,10 @@ func draw(listen string, status TUIStatus, b *Balancer, recent *RecentConns, pre
 
 	// Links table
 	links := b.SnapshotView()
+	var scores map[string]float64
+	if scorer != nil {
+		scores = scorer.ScoreSnapshot(b.HealthyLinks())
+	}
 	anyHealthy := false
 	for _, l := range links {
 		if l.Healthy {
@@ -123,8 +127,8 @@ func draw(listen string, status TUIStatus, b *Balancer, recent *RecentConns, pre
 	}
 
 	sb.WriteString(ansiBold)
-	sb.WriteString(fmt.Sprintf(" %-14s %-16s %-8s %-7s %-7s %-8s %-12s %-12s %-10s %-10s\n",
-		"LINK", "IP", "STATUS", "PROBE", "ACTIVE", "TOTAL", "DOWN", "UP", "↓ MB/s", "↑ MB/s"))
+	sb.WriteString(fmt.Sprintf(" %-14s %-16s %-8s %-7s %-7s %-8s %-12s %-12s %-10s %-10s %-8s\n",
+		"LINK", "IP", "STATUS", "PROBE", "ACTIVE", "TOTAL", "DOWN", "UP", "↓ MB/s", "↑ MB/s", "SCORE"))
 	sb.WriteString(ansiReset)
 
 	for _, l := range links {
@@ -145,7 +149,13 @@ func draw(listen string, status TUIStatus, b *Balancer, recent *RecentConns, pre
 				}
 			}
 		}
-		sb.WriteString(fmt.Sprintf(" %-14s %-16s %s%s%s  %-7s %-7d %-7d %-12s %-12s %-10.2f %-10.2f\n",
+		scoreStr := "-"
+		if scores != nil {
+			if sc, ok := scores[l.Name]; ok && sc > 0 {
+				scoreStr = fmtScore(sc)
+			}
+		}
+		sb.WriteString(fmt.Sprintf(" %-14s %-16s %s%s%s  %-7s %-7d %-7d %-12s %-12s %-10.2f %-10.2f %-8s\n",
 			truncate(l.Name, 14),
 			l.LocalIP.String(),
 			statusColor, statusText, ansiReset,
@@ -156,6 +166,7 @@ func draw(listen string, status TUIStatus, b *Balancer, recent *RecentConns, pre
 			fmtBytes(l.BytesOut),
 			rateIn,
 			rateOut,
+			scoreStr,
 		))
 	}
 
@@ -231,6 +242,17 @@ func truncate(s string, n int) string {
 		return s[:n]
 	}
 	return s[:n-1] + "…"
+}
+
+func fmtScore(bps float64) string {
+	switch {
+	case bps >= 1048576:
+		return fmt.Sprintf("%.1fM", bps/1048576)
+	case bps >= 1024:
+		return fmt.Sprintf("%.0fK", bps/1024)
+	default:
+		return fmt.Sprintf("%.0f", bps)
+	}
 }
 
 func fmtBytes(n int64) string {
