@@ -86,3 +86,56 @@ func TestIgnoresZeroByteSamples(t *testing.T) {
 		t.Fatalf("expected zero score with no valid samples, got %f", score)
 	}
 }
+
+func TestColdStartUsesProbeLatency(t *testing.T) {
+	s := NewLinkScorer()
+	fast := &Link{Name: "wifi", LocalIP: net.ParseIP("10.0.0.1"), ProbeLatency: 10 * time.Millisecond}
+	slow := &Link{Name: "tether", LocalIP: net.ParseIP("10.0.0.2"), ProbeLatency: 100 * time.Millisecond}
+
+	// No samples recorded — should fall back to probe latency
+	fastScore := s.Score(fast)
+	slowScore := s.Score(slow)
+
+	if fastScore <= slowScore {
+		t.Fatalf("lower latency link should score higher: fast=%f slow=%f", fastScore, slowScore)
+	}
+}
+
+func TestColdStartTransitionsToEWMA(t *testing.T) {
+	s := NewLinkScorer()
+	link := &Link{Name: "wifi", LocalIP: net.ParseIP("10.0.0.1"), ProbeLatency: 10 * time.Millisecond}
+
+	coldScore := s.Score(link)
+
+	// Record enough samples to exit cold start
+	for i := 0; i < coldStartThreshold; i++ {
+		s.RecordSample(link, 5_000_000, 1*time.Second)
+	}
+
+	warmScore := s.Score(link)
+
+	// Both should be positive but from different formulas
+	if coldScore <= 0 || warmScore <= 0 {
+		t.Fatalf("both scores should be positive: cold=%f warm=%f", coldScore, warmScore)
+	}
+}
+
+func TestIsStaleWithNoSamples(t *testing.T) {
+	s := NewLinkScorer()
+	link := &Link{Name: "wifi", LocalIP: net.ParseIP("10.0.0.1")}
+
+	if !s.IsStale(link) {
+		t.Fatal("link with no samples should be stale")
+	}
+}
+
+func TestIsStaleAfterRecordSample(t *testing.T) {
+	s := NewLinkScorer()
+	link := &Link{Name: "wifi", LocalIP: net.ParseIP("10.0.0.1")}
+
+	s.RecordSample(link, 1_000_000, 1*time.Second)
+
+	if s.IsStale(link) {
+		t.Fatal("link should not be stale immediately after sample")
+	}
+}
