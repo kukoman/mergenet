@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"io"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -204,4 +205,50 @@ func TestProxyReturnsNetworkUnreachableWhenNoLinks(t *testing.T) {
 	if rep[1] != repNetworkUnreach {
 		t.Fatalf("expected network unreachable, got %d", rep[1])
 	}
+}
+
+func TestLinkConnCloseRecordsSample(t *testing.T) {
+	scorer := NewLinkScorer()
+	link := &Link{Name: "wifi", LocalIP: net.ParseIP("10.0.0.1")}
+
+	// Simulate some bytes flowing through the link
+	atomic.AddInt64(&link.BytesIn, 500_000)
+
+	server, client := net.Pipe()
+	defer server.Close()
+
+	lc := &LinkConn{
+		Conn:       client,
+		Link:       link,
+		Name:       "wifi",
+		startTime:  time.Now().Add(-1 * time.Second),
+		bytesStart: 0,
+		scorer:     scorer,
+	}
+
+	lc.Close()
+
+	score := scorer.Score(link)
+	if score <= 0 {
+		t.Fatalf("expected positive score after Close(), got %f", score)
+	}
+}
+
+func TestLinkConnCloseSkipsSampleWhenNoScorer(t *testing.T) {
+	link := &Link{Name: "wifi", LocalIP: net.ParseIP("10.0.0.1")}
+	atomic.AddInt64(&link.BytesIn, 500_000)
+
+	server, client := net.Pipe()
+	defer server.Close()
+
+	lc := &LinkConn{
+		Conn:       client,
+		Link:       link,
+		Name:       "wifi",
+		startTime:  time.Now().Add(-1 * time.Second),
+		bytesStart: 0,
+	}
+
+	// Should not panic
+	lc.Close()
 }

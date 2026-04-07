@@ -49,6 +49,7 @@ type socksRequest struct {
 // ProxyConfig holds runtime settings for the proxy.
 type ProxyConfig struct {
 	Balancer *Balancer
+	Scorer   *LinkScorer
 	Recent   *RecentConns
 	Minter   *Minter         // nil = MITM unavailable (CA not installed)
 	MITMCtrl *MITMController // runtime on/off switch; nil = always off
@@ -94,7 +95,7 @@ func handleConn(client net.Conn, pc *ProxyConfig) {
 //
 // Outbound proxy traffic flows through this layer. The contract is:
 //
-//   1. handlers call dialLink(target, balancer)
+//   1. handlers call dialLink(target, balancer, scorer)
 //   2. dialLink picks a healthy link, dials bound to that link's source IP,
 //      and retries once on another link if the first dial fails
 //   3. callers receive a *LinkConn that owns the link's accounting lifetime;
@@ -120,10 +121,13 @@ var errNoHealthyLinks = errors.New("no healthy links")
 // Link is nil for loopback targets (Name == "local"), in which case no
 // accounting is performed.
 type LinkConn struct {
-	Conn     net.Conn
-	Link     *Link
-	Name     string
-	released int32
+	Conn       net.Conn
+	Link       *Link
+	Name       string
+	released   int32
+	startTime  time.Time   // when the connection was created
+	bytesStart int64       // snapshot of link.BytesIn at creation
+	scorer     *LinkScorer // for recording throughput samples on Close
 }
 
 // Close closes the underlying connection and releases the link's
@@ -132,6 +136,12 @@ func (lc *LinkConn) Close() error {
 	err := lc.Conn.Close()
 	if lc.Link != nil && atomic.CompareAndSwapInt32(&lc.released, 0, 1) {
 		atomic.AddInt64(&lc.Link.ActiveConns, -1)
+		if lc.scorer != nil {
+			bytesEnd := atomic.LoadInt64(&lc.Link.BytesIn)
+			bytesTransferred := bytesEnd - lc.bytesStart
+			dur := time.Since(lc.startTime)
+			lc.scorer.RecordSample(lc.Link, bytesTransferred, dur)
+		}
 	}
 	return err
 }
@@ -143,6 +153,7 @@ type dialChoice struct {
 	dialer *net.Dialer
 	link   *Link // nil for loopback
 	name   string
+	scorer *LinkScorer
 }
 
 // release undoes the ActiveConns increment that b.Pick() performed when
@@ -160,7 +171,7 @@ func (d *dialChoice) release() {
 // Each call increments ActiveConns on the picked link; the caller MUST
 // either use the returned choice to open a conn (ownership transferred to
 // a LinkConn, released on Close) or call release() on failure.
-func chooseDialer(target string, b *Balancer) *dialChoice {
+func chooseDialer(target string, b *Balancer, scorer *LinkScorer) *dialChoice {
 	if isLoopbackTarget(target) {
 		return &dialChoice{
 			dialer: &net.Dialer{Timeout: 10 * time.Second},
@@ -178,6 +189,7 @@ func chooseDialer(target string, b *Balancer) *dialChoice {
 		dialer: link.NewDialer(10 * time.Second),
 		link:   link,
 		name:   link.Name,
+		scorer: scorer,
 	}
 }
 
@@ -216,11 +228,11 @@ func chooseDialer(target string, b *Balancer) *dialChoice {
 //
 // Not used by rangesplit / MITM paths, which have their own chunk-level
 // retry semantics in rangesplit.go.
-func dialLink(target string, b *Balancer) (*LinkConn, error) {
+func dialLink(target string, b *Balancer, scorer *LinkScorer) (*LinkConn, error) {
 	const maxAttempts = 2
 	var firstErr error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		ch := chooseDialer(target, b)
+		ch := chooseDialer(target, b, scorer)
 		if ch == nil {
 			if firstErr != nil {
 				return nil, firstErr
@@ -229,7 +241,18 @@ func dialLink(target string, b *Balancer) (*LinkConn, error) {
 		}
 		conn, err := ch.dialer.Dial("tcp", target)
 		if err == nil {
-			return &LinkConn{Conn: conn, Link: ch.link, Name: ch.name}, nil
+			var bytesStart int64
+			if ch.link != nil {
+				bytesStart = atomic.LoadInt64(&ch.link.BytesIn)
+			}
+			return &LinkConn{
+				Conn:       conn,
+				Link:       ch.link,
+				Name:       ch.name,
+				startTime:  time.Now(),
+				bytesStart: bytesStart,
+				scorer:     ch.scorer,
+			}, nil
 		}
 		ch.release()
 		if firstErr == nil {
@@ -337,7 +360,7 @@ func handleSOCKS5(client net.Conn, br *bufio.Reader, pc *ProxyConfig) {
 		return
 	}
 
-	upstream, err := dialLink(req.Target, b)
+	upstream, err := dialLink(req.Target, b, pc.Scorer)
 	if err != nil {
 		if errors.Is(err, errNoHealthyLinks) {
 			_ = socks5Reply(client, repNetworkUnreach)
@@ -396,7 +419,7 @@ func handleHTTP(client net.Conn, br *bufio.Reader, pc *ProxyConfig) {
 		}
 	}
 
-	upstream, err := dialLink(target, b)
+	upstream, err := dialLink(target, b, pc.Scorer)
 	if err != nil {
 		if errors.Is(err, errNoHealthyLinks) {
 			writeHTTPError(client, 503, "no healthy links")
