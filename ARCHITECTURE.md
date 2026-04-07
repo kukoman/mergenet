@@ -12,15 +12,21 @@ mergenet is a local SOCKS5+HTTP proxy that round-robins each new TCP connection 
 
 All traffic hits [proxy.go](proxy.go) `ServeSOCKS5` which peeks the first byte to detect SOCKS5 (`0x05`) vs HTTP (`G`/`P`/`C`…) and dispatches to `handleSOCKS5` or `handleHTTP`. Both handlers converge on one decision: **tunnel or intercept**.
 
-### 2. Per-connection adapter selection
+### 2. Private/local bypass
 
-`chooseDialer(target, balancer)` picks a healthy link via `Balancer.Pick()` (weighted round-robin), creates a `net.Dialer` with `LocalAddr = link.LocalIP`, and dials. The kernel then routes that socket out the matching interface, regardless of the default route. **This is the core trick** — no tun/tap, no routing tables, just per-socket source binding.
+Before link selection, `isLoopbackTarget` ([proxy.go](proxy.go)) checks whether the target should bypass the proxy entirely and connect directly. This covers loopback (`127.0.0.0/8`, `::1`), RFC 1918 private subnets (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), link-local addresses (`169.254.0.0/16`), and IANA-reserved dev TLDs (`.localhost`, `.local`, `.test`, `.invalid`, `.example`). These get an unbound dialer — no link selection, no accounting.
 
-### 3a. Tunnel path (default for most HTTPS)
+### 3. Per-connection adapter selection
+
+`chooseDialer(target, balancer, scorer)` picks a healthy link via `Balancer.Pick()` and creates a `net.Dialer` with `LocalAddr = link.LocalIP`. The kernel then routes that socket out the matching interface, regardless of the default route. **This is the core trick** — no tun/tap, no routing tables, just per-socket source binding.
+
+**Link selection** uses adaptive throughput scoring when a `LinkScorer` is available: `pickByScore()` prefers the link with the highest `score = EWMA_throughput / activeConns`, with exploration for stale/cold links. Falls back to weighted round-robin when scoring is unavailable or all links are cold.
+
+### 4a. Tunnel path (default for most HTTPS)
 
 For HTTPS CONNECTs where MITM is not active, `spliceCountedConns(client, upstream, link)` bidirectionally copies bytes with per-direction counters. Browser's TLS handshake happens directly with the real origin server — we never see plaintext. HTTP/2 multiplexing works natively, no serialization. Fast.
 
-### 3b. MITM path (for HTTPS CONNECTs when `MITMController.Enabled()`)
+### 4b. MITM path (for HTTPS CONNECTs when `MITMController.Enabled()`)
 
 This is the complex bit. See "MITM subsystem" below.
 
@@ -82,17 +88,21 @@ Why a bounded channel instead of `io.Pipe`? Pipe is unbuffered — would seriali
 | File | Responsibility |
 |---|---|
 | [main.go](main.go) | CLI flags, startup, adapter scan loop, signal handling, TUI vs log-mode dispatch |
-| [proxy.go](proxy.go) | SOCKS5 + HTTP proxy dispatcher, `chooseDialer`, tunnel splice, connection routing |
+| [proxy.go](proxy.go) | SOCKS5 + HTTP proxy dispatcher, `chooseDialer`, tunnel splice, connection routing, `isLoopbackTarget` (private/local bypass) |
 | [mitm.go](mitm.go) | `InterceptHTTPS` (h2+h1 server), `mitmHandler`, `forwardOrSplit`, `handleUpgrade`, `oneConnListener`, per-link `http.Transport` cache |
 | [mitm_control.go](mitm_control.go) | `MITMController` (runtime on/off toggle), stdin keypress loop (`m`+Enter) |
 | [rangesplit.go](rangesplit.go) | `shouldSplit` (response-header detection), `splitAcrossLinks`, `computeChunks`, `bufferSlots`, `chunkBuf` (bounded in-memory buffer), `fetchChunk` (with retry), `pickAlternative` |
-| [balancer.go](balancer.go) | `Link` + `Balancer` (weighted round-robin `Pick`, `Upsert`, `HealthyLinks`, `SnapshotView`) |
+| [balancer.go](balancer.go) | `Link` + `Balancer` (score-based `Pick` with round-robin fallback, `Upsert`, `HealthyLinks`, `SnapshotView`) |
 | [ca.go](ca.go) | Root CA generation and on-disk caching |
 | [ca_windows.go](ca_windows.go) | Windows-specific CA install (`certutil`), admin detection, UAC elevation, `fMinimizeConnections` registry fix |
 | [ca_other.go](ca_other.go) | macOS/Linux CA install (`security add-trusted-cert`), stubs for non-Windows |
 | [mint.go](mint.go) | Per-host leaf-cert minting from the root CA |
 | [interfaces.go](interfaces.go) | `EnumerateAdapters`, per-platform adapter blacklist, `ProbeAdapter` |
 | [tui.go](tui.go) | Live terminal UI — per-link table, rate calculation, recent connections, MITM toggle state |
+| [scorer.go](scorer.go) | `LinkScorer` — EWMA throughput tracking, `RecordSample`, `Score` (throughput/activeConns), staleness detection |
+| [link_net.go](link_net.go) | Per-link networking factory: `Link.NewDialer` (re-reads LocalIP each dial), `Link.Transport` (cached `http.Transport` with HTTP/2 PING health checks) |
+| [errors_net.go](errors_net.go) | Cross-platform network error helpers: `isAddrInUse`, `isBindUnavailable` (handles Windows WSA codes) |
+| [log_sink.go](log_sink.go) | `LogSink` — buffered `io.Writer` that flushes periodically to disk, toggleable at runtime |
 | [stats.go](stats.go) | `RecentConns` ring buffer for the TUI |
 | [console_windows.go](console_windows.go), [console_other.go](console_other.go) | VT processing enable on Windows, no-op elsewhere |
 
@@ -100,8 +110,11 @@ Why a bounded channel instead of `io.Pipe`? Pipe is unbuffered — would seriali
 
 ## Key invariants and gotchas
 
+- **Private subnets and dev TLDs bypass link selection entirely.** `isLoopbackTarget` catches RFC 1918, link-local, loopback, and reserved TLDs (`.test`, `.local`, `.localhost`, `.invalid`, `.example`) so local dev hosts always connect directly.
 - **Per-socket routing** works because every outbound connection (tunnel and every chunk fetcher) creates its own `net.Dialer` with `LocalAddr` set. The OS picks the route matching that source IP. There is no global routing change.
 - **`Balancer.Pick()` mutates** — it atomically increments `ActiveConns` and `TotalConns` on the chosen link. Every caller **must** decrement `ActiveConns` when done (`defer atomic.AddInt64(&link.ActiveConns, -1)`).
+- **Adaptive scoring:** `LinkScorer` tracks EWMA throughput per link. `LinkConn.Close()` feeds `(bytesTransferred, duration)` samples. `Balancer.pickByScore()` ranks links by `throughput / activeConns`, with exploration for stale/cold links. Falls back to weighted round-robin when all links lack data.
+- **HTTP/2 PING health checks:** `Link.Transport()` ([link_net.go](link_net.go)) configures HTTP/2 transports with periodic PINGs to detect stale connections before they cause request timeouts.
 - **`linkTransport` cache is keyed by `*Link` pointer.** If a Link is recreated (different pointer, same name), the old transport leaks and a new one is built. `Balancer.Upsert` deliberately reuses the same pointer to avoid this.
 - **MITM toggle is live, not a flag.** Default state: ON if CA is installed/loadable. User toggles via `m`+Enter in the TUI (reads `stdin` line-buffered — no raw-mode terminal needed).
 - **Split gates are all on the response, not the request URL:** GET method, ≥2 healthy links, effective size ≥ 10 MB, `Accept-Ranges: bytes` (on 200) or 206 with valid `Content-Range`, no `Content-Encoding`, not a streaming content-type. No URL extension matching, no HEAD probes.
