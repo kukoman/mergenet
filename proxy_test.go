@@ -252,3 +252,56 @@ func TestLinkConnCloseSkipsSampleWhenNoScorer(t *testing.T) {
 	// Should not panic
 	lc.Close()
 }
+
+func TestIsLoopbackTarget(t *testing.T) {
+	tests := []struct {
+		target string
+		want   bool
+	}{
+		// Original loopback behaviour
+		{"localhost:80", true},
+		{"127.0.0.1:443", true},
+		{"[::1]:8080", true},
+
+		// RFC 1918 private ranges
+		{"10.0.0.1:80", true},
+		{"10.255.255.255:80", true},
+		{"172.16.0.1:80", true},
+		{"172.31.255.255:80", true},
+		{"192.168.1.1:80", true},
+		{"192.168.0.100:3000", true},
+
+		// Just outside 172.16-31 range
+		{"172.15.0.1:80", false},
+		{"172.32.0.1:80", false},
+
+		// Link-local
+		{"169.254.1.1:80", true},
+
+		// Dev TLDs
+		{"myapp.test:80", true},
+		{"myapp.localhost:80", true},
+		{"foo.bar.local:443", true},
+		{"something.invalid:80", true},
+		{"demo.example:80", true},
+
+		// Case insensitive TLDs
+		{"MyApp.TEST:80", true},
+		{"FOO.LOCALHOST:443", true},
+
+		// Public IPs — must NOT bypass
+		{"8.8.8.8:53", false},
+		{"1.1.1.1:443", false},
+		{"google.com:443", false},
+		{"example.com:80", false},
+
+		// Malformed
+		{"noport", false},
+	}
+	for _, tt := range tests {
+		got := isLoopbackTarget(tt.target)
+		if got != tt.want {
+			t.Errorf("isLoopbackTarget(%q) = %v, want %v", tt.target, got, tt.want)
+		}
+	}
+}

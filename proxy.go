@@ -532,17 +532,52 @@ func copyWithCounter(dst io.Writer, src io.Reader, counter *int64) (int64, error
 	}
 }
 
-// isLoopbackTarget returns true if "host:port" refers to the local machine.
+// bypassTLDs lists IANA-reserved and common development TLDs that should
+// never be routed through an upstream link.
+var bypassTLDs = []string{
+	".localhost",
+	".local",
+	".test",
+	".invalid",
+	".example",
+}
+
+// isLoopbackTarget returns true if "host:port" refers to the local machine
+// or a private/reserved network address that should bypass link selection.
+// This covers RFC 1918 private subnets, link-local, loopback, and
+// IANA-reserved development TLDs.
 func isLoopbackTarget(target string) bool {
 	host, _, err := net.SplitHostPort(target)
 	if err != nil {
 		return false
 	}
-	if host == "localhost" {
+	lower := strings.ToLower(host)
+	if lower == "localhost" {
 		return true
 	}
-	if ip := net.ParseIP(host); ip != nil {
-		return ip.IsLoopback()
+	for _, tld := range bypassTLDs {
+		if strings.HasSuffix(lower, tld) {
+			return true
+		}
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+		return true
+	}
+	// RFC 1918 private ranges: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+	if ip4 := ip.To4(); ip4 != nil {
+		if ip4[0] == 10 {
+			return true
+		}
+		if ip4[0] == 172 && ip4[1] >= 16 && ip4[1] <= 31 {
+			return true
+		}
+		if ip4[0] == 192 && ip4[1] == 168 {
+			return true
+		}
 	}
 	return false
 }
