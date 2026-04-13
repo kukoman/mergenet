@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-var Version = "1.3.2"
+var Version = "1.4.0"
 
 const (
 	probeTarget  = "1.1.1.1:53"
@@ -34,8 +34,11 @@ func main() {
 		uninstallC  = flag.Bool("uninstall-cert", false, "remove mergenet CA from the system trust store (admin/sudo required) and exit")
 		setupOnly   = flag.Bool("setup-only", false, "(internal) run admin setup tasks and exit — used by elevation path")
 		noElevate   = flag.Bool("no-elevate", false, "don't offer automatic elevation when running non-admin (Windows UAC only)")
+		insecure    = flag.Bool("insecure", false, "skip upstream TLS certification verification (helps with MITM connection errors)")
 	)
 	flag.Parse()
+
+	GlobalInsecureSkipVerify = *insecure
 
 	enableVirtualTerminal()
 

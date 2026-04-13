@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"log"
 	"net"
 	"net/http"
@@ -47,6 +48,7 @@ import (
 var (
 	linkTransportMu sync.RWMutex
 	linkTransports  = map[*Link]*http.Transport{}
+	GlobalInsecureSkipVerify bool
 )
 
 // NewDialer returns a net.Dialer whose LocalAddr is bound to this
@@ -90,6 +92,9 @@ func (l *Link) Transport() *http.Transport {
 				KeepAlive: 30 * time.Second,
 			}
 			return d.DialContext(ctx, network, addr)
+		},
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: GlobalInsecureSkipVerify,
 		},
 		TLSHandshakeTimeout:   10 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Second,

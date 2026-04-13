@@ -113,7 +113,7 @@ func forwardOrSplit(w http.ResponseWriter, req *http.Request, b *Balancer, recen
 
 	outReq := req.Clone(req.Context())
 	outReq.RequestURI = ""
-	if outReq.Body != nil {
+	if outReq.Body != nil && outReq.Body != http.NoBody {
 		outReq.Body = &countingReadCloser{rc: outReq.Body, counter: &link.BytesOut}
 	}
 	stripHopByHop(outReq.Header)
