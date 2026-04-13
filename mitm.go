@@ -127,7 +127,7 @@ func forwardOrSplit(w http.ResponseWriter, req *http.Request, b *Balancer, recen
 	// retry when the request has no body — otherwise we'd need to reset
 	// or re-clone the body, which isn't worth the complexity for the
 	// 99% case (browser GETs, including range requests for media).
-	if err != nil && isBindUnavailable(err) && outReq.Body == nil {
+	if err != nil && isBindUnavailable(err) && req.ContentLength == 0 {
 		log.Printf("[%s] MITM bind failed, retrying on another link: %v", link.Name, err)
 		releaseLink()
 		if next := b.Pick(); next != nil {
@@ -139,7 +139,7 @@ func forwardOrSplit(w http.ResponseWriter, req *http.Request, b *Balancer, recen
 	}
 	
 	// Fallback for upstream TLS verification failures
-	if err != nil && outReq.Body == nil && !GlobalInsecureSkipVerify {
+	if err != nil && req.ContentLength == 0 && !GlobalInsecureSkipVerify {
 		var certErr x509.UnknownAuthorityError
 		var hostErr x509.HostnameError
 		var certInv x509.CertificateInvalidError
