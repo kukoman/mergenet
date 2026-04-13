@@ -2,6 +2,8 @@ package main
 
 import (
 	"crypto/tls"
+	"crypto/x509"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -135,6 +137,28 @@ func forwardOrSplit(w http.ResponseWriter, req *http.Request, b *Balancer, recen
 			resp, err = tr.RoundTrip(outReq)
 		}
 	}
+	
+	// Fallback for upstream TLS verification failures
+	if err != nil && outReq.Body == nil && !GlobalInsecureSkipVerify {
+		var certErr x509.UnknownAuthorityError
+		var hostErr x509.HostnameError
+		var certInv x509.CertificateInvalidError
+		if errors.As(err, &certErr) || errors.As(err, &hostErr) || errors.As(err, &certInv) {
+			log.Printf("[%s] WARNING: Bypassing upstream TLS error for %s (%v)", link.Name, req.URL.Host, err)
+			
+			insecureTr := tr.Clone()
+			if insecureTr.TLSClientConfig == nil {
+				insecureTr.TLSClientConfig = &tls.Config{}
+			}
+			insecureTr.TLSClientConfig.InsecureSkipVerify = true
+			
+			outReqRetry := req.Clone(req.Context())
+			outReqRetry.RequestURI = ""
+			stripHopByHop(outReqRetry.Header)
+			resp, err = insecureTr.RoundTrip(outReqRetry)
+		}
+	}
+
 	if err != nil {
 		http.Error(w, "mergenet: "+err.Error(), http.StatusBadGateway)
 		log.Printf("[%s] MITM forward %s %s failed: %v", link.Name, req.Method, req.URL.Host, err)
