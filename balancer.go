@@ -45,10 +45,17 @@ type Balancer struct {
 	links  []*Link
 	next   int
 	scorer *LinkScorer
+	// hostPins pins a destination host to a specific link name so repeated
+	// requests for the same host egress via the same WAN IP. This is what
+	// keeps IP-bound session state valid — e.g. Cloudflare's cf_clearance
+	// cookie and Turnstile challenge state, which are rejected when the
+	// source IP changes mid-flow. Pin survives until the pinned link goes
+	// unhealthy, at which point PickForHost repins to another healthy link.
+	hostPins map[string]string
 }
 
 func NewBalancer() *Balancer {
-	return &Balancer{}
+	return &Balancer{hostPins: make(map[string]string)}
 }
 
 // AddLink adds a new link if no link with the same name already exists.
@@ -150,6 +157,54 @@ func (b *Balancer) Pick() *Link {
 		return b.pickRoundRobin()
 	}
 	return b.pickByScore()
+}
+
+// PickForHost returns a healthy link that is pinned to the given destination
+// host. The first call for a host picks a link via the normal Pick() policy
+// and records the pin; subsequent calls for the same host return the same
+// link as long as it remains healthy. If the pinned link goes unhealthy, the
+// pin is dropped and a new link is chosen (and pinned). Callers must still
+// decrement ActiveConns when the connection ends, exactly as with Pick.
+//
+// This exists to keep IP-bound session state coherent — most notably
+// Cloudflare's cf_clearance cookie and Turnstile challenge flow, which tie
+// the issued clearance to the source IP that solved the challenge. Without
+// host affinity, challenge sub-requests fan out across WAN links with
+// different egress IPs and the challenge never completes.
+func (b *Balancer) PickForHost(host string) *Link {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.hostPins == nil {
+		b.hostPins = make(map[string]string)
+	}
+
+	// Existing pin? Use it if the pinned link is still healthy.
+	if name, ok := b.hostPins[host]; ok {
+		for _, l := range b.links {
+			if l.Name == name {
+				if l.Healthy {
+					atomic.AddInt64(&l.ActiveConns, 1)
+					atomic.AddInt64(&l.TotalConns, 1)
+					return l
+				}
+				break
+			}
+		}
+		// Stale pin — drop and repin below.
+		delete(b.hostPins, host)
+	}
+
+	var l *Link
+	if b.scorer == nil {
+		l = b.pickRoundRobin()
+	} else {
+		l = b.pickByScore()
+	}
+	if l != nil {
+		b.hostPins[host] = l.Name
+	}
+	return l
 }
 
 // pickRoundRobin is the original weighted round-robin selection. Used as

@@ -97,7 +97,19 @@ func (h *mitmHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // content, and servers without range support all fall through with zero
 // extra round-trips.
 func forwardOrSplit(w http.ResponseWriter, req *http.Request, b *Balancer, recent *RecentConns) {
-	link := b.Pick()
+	// Clear Body + ContentLength for bodyless methods on req itself (not
+	// just outReq) because rangesplit's splitAcrossLinks / fetchChunkOnce
+	// / probeTotalSize later Clone req for their sub-requests — any
+	// leftover Body/ContentLength mismatch would propagate there and
+	// cause "411 Length Required" or "ContentLength=-1 with nil Body"
+	// on chunk fetches.
+	dropBodyForBodylessMethods(req)
+
+	// Pin per destination host so IP-bound session state (Cloudflare
+	// cf_clearance / Turnstile, bank session cookies, etc.) stays valid
+	// across the many sub-requests a single page triggers. Without this,
+	// cross-link rotation made Turnstile loop forever.
+	link := b.PickForHost(req.URL.Host)
 	if link == nil {
 		http.Error(w, "mergenet: no healthy links", http.StatusServiceUnavailable)
 		return
@@ -115,7 +127,7 @@ func forwardOrSplit(w http.ResponseWriter, req *http.Request, b *Balancer, recen
 
 	outReq := req.Clone(req.Context())
 	outReq.RequestURI = ""
-	if outReq.Body != nil && outReq.Body != http.NoBody {
+	if outReq.Body != nil {
 		outReq.Body = &countingReadCloser{rc: outReq.Body, counter: &link.BytesOut}
 	}
 	stripHopByHop(outReq.Header)
@@ -201,7 +213,7 @@ func handleUpgrade(w http.ResponseWriter, req *http.Request, b *Balancer, recent
 		http.Error(w, "mergenet: hijack unsupported", http.StatusInternalServerError)
 		return
 	}
-	link := b.Pick()
+	link := b.PickForHost(req.URL.Host)
 	if link == nil {
 		http.Error(w, "mergenet: no healthy links", http.StatusServiceUnavailable)
 		return
@@ -317,6 +329,26 @@ func flushIfPossible(w http.ResponseWriter) {
 }
 
 // ----- counting helpers ----------------------------------------------------
+
+// dropBodyForBodylessMethods clears req.Body + req.ContentLength when the
+// method semantically cannot carry a body (GET/HEAD/DELETE/OPTIONS/TRACE).
+//
+// Why this is non-optional: Go's net/http2 server wraps every incoming
+// request in a *http2.requestBody whose first Read may return (0, nil)
+// before the subsequent (0, io.EOF). Go's http.Transport chunked-body
+// probe interprets that non-EOF first read as "body might have streaming
+// content" and silently flips Transfer-Encoding: chunked on — even for
+// a GET — and strict origins / WAFs then reject with 411 Length Required.
+// Clearing Body + ContentLength together skips the probe and emits a
+// clean bodyless request. Must run at the top of the dispatcher so that
+// rangesplit's sub-request Clone()s inherit the already-cleaned fields.
+func dropBodyForBodylessMethods(req *http.Request) {
+	switch req.Method {
+	case http.MethodGet, http.MethodHead, http.MethodDelete, http.MethodOptions, http.MethodTrace:
+		req.Body = nil
+		req.ContentLength = 0
+	}
+}
 
 // countingReadCloser wraps an io.ReadCloser and increments a counter for every
 // byte read. Used to track request-body upload bytes.

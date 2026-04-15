@@ -106,7 +106,7 @@ func draw(listen string, status TUIStatus, b *Balancer, scorer *LinkScorer, rece
 		sb.WriteString(" " + ansiYellow + "⚠  WiFi-keep-alive policy fix not applied — WiFi may drop when tethering. Run once as Administrator." + ansiReset + "\n")
 	}
 
-	sb.WriteString(ansiDim + strings.Repeat("─", 100) + ansiReset + "\n")
+	sb.WriteString(ansiDim + strings.Repeat("─", 120) + ansiReset + "\n")
 
 	// Links table
 	links := b.SnapshotView()
@@ -123,20 +123,20 @@ func draw(listen string, status TUIStatus, b *Balancer, scorer *LinkScorer, rece
 	}
 	if !anyHealthy {
 		sb.WriteString(ansiRed + ansiBold + " ⚠  NO HEALTHY LINKS — proxy is refusing new connections" + ansiReset + "\n")
-		sb.WriteString(ansiDim + strings.Repeat("─", 100) + ansiReset + "\n")
+		sb.WriteString(ansiDim + strings.Repeat("─", 120) + ansiReset + "\n")
 	}
 
 	sb.WriteString(ansiBold)
-	sb.WriteString(fmt.Sprintf(" %-14s %-16s %-8s %-7s %-7s %-8s %-12s %-12s %-10s %-10s %-8s\n",
+	sb.WriteString(fmt.Sprintf(" %-14s %-16s %-8s %-7s %-7s %-8s %-12s %-12s %-10s %-10s %s\n",
 		"LINK", "IP", "STATUS", "PROBE", "ACTIVE", "TOTAL", "DOWN", "UP", "↓ MB/s", "↑ MB/s", "SCORE"))
 	sb.WriteString(ansiReset)
 
 	for _, l := range links {
 		statusColor := ansiGreen
-		statusText := "● UP  "
+		statusText := "● UP    "
 		if !l.Healthy {
 			statusColor = ansiRed
-			statusText = "● DOWN"
+			statusText = "● DOWN  "
 		}
 		rateIn, rateOut := 0.0, 0.0
 		if dt > 0 {
@@ -155,7 +155,7 @@ func draw(listen string, status TUIStatus, b *Balancer, scorer *LinkScorer, rece
 				scoreStr = fmtScore(sc)
 			}
 		}
-		sb.WriteString(fmt.Sprintf(" %-14s %-16s %s%s%s  %-7s %-7d %-7d %-12s %-12s %-10.2f %-10.2f %-8s\n",
+		sb.WriteString(fmt.Sprintf(" %-14s %-16s %s%s%s %-7s %-7d %-8d %-12s %-12s %-10.2f %-10.2f %s\n",
 			truncate(l.Name, 14),
 			l.LocalIP.String(),
 			statusColor, statusText, ansiReset,
@@ -170,7 +170,7 @@ func draw(listen string, status TUIStatus, b *Balancer, scorer *LinkScorer, rece
 		))
 	}
 
-	sb.WriteString(ansiDim + strings.Repeat("─", 100) + ansiReset + "\n")
+	sb.WriteString(ansiDim + strings.Repeat("─", 120) + ansiReset + "\n")
 	sb.WriteString(ansiBold + " RECENT CONNECTIONS" + ansiReset + ansiDim + " (newest first)" + ansiReset + "\n")
 
 	recs := recent.Snapshot()
@@ -196,7 +196,7 @@ func draw(listen string, status TUIStatus, b *Balancer, scorer *LinkScorer, rece
 		sb.WriteString(ansiDim + "  (none yet — configure Windows proxy: 127.0.0.1:1080 and browse)" + ansiReset + "\n")
 	}
 
-	sb.WriteString(ansiDim + strings.Repeat("─", 100) + ansiReset + "\n")
+	sb.WriteString(ansiDim + strings.Repeat("─", 120) + ansiReset + "\n")
 	logOn := status.LogSink != nil && status.LogSink.Enabled()
 	logHint := "'l'+Enter: log OFF"
 	if logOn {
